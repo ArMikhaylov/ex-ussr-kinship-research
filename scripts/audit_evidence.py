@@ -54,6 +54,20 @@ VALID_CLAIM_STATUSES = {
 }
 
 
+EXTRA_FIELDS_KEY = "__extra_fields__"
+PROVENANCED_ORIGINALITY = {"original", "image-of-original", "official-extract"}
+
+
+def artifact_groups(artifact_ids: Iterable[str], artifact_by_id: dict[str, dict[str, str]]) -> set[str]:
+    """Independence groups backed by existing artifacts; declared groups are not counted."""
+    return {
+        artifact_by_id[artifact_id].get("independence_group", "")
+        for artifact_id in artifact_ids
+        if artifact_id in artifact_by_id
+        and artifact_by_id[artifact_id].get("independence_group", "")
+    }
+
+
 def split_ids(value: str) -> list[str]:
     if not value:
         return []
@@ -65,13 +79,21 @@ def read_csv(path: Path, required: set[str]) -> tuple[list[dict[str, str]], list
     errors: list[str] = []
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
-            reader = csv.DictReader(handle)
+            reader = csv.DictReader(handle, restkey=EXTRA_FIELDS_KEY)
             if reader.fieldnames is None:
                 return [], [f"{path.name}: отсутствует строка заголовка"]
             missing = sorted(required - set(reader.fieldnames))
             if missing:
                 errors.append(f"{path.name}: отсутствуют колонки: {', '.join(missing)}")
-            rows = [{k: (v or "").strip() for k, v in row.items()} for row in reader]
+            rows: list[dict[str, str]] = []
+            for row in reader:
+                extra = row.pop(EXTRA_FIELDS_KEY, None)
+                if extra:
+                    errors.append(
+                        f"{path.name}: строка {reader.line_num}: лишние поля ({len(extra)}) "
+                        "сверх заголовка; проверьте разделители и кавычки"
+                    )
+                rows.append({k: (v or "").strip() for k, v in row.items()})
             return rows, errors
     except OSError as exc:
         return [], [f"{path.name}: ошибка чтения: {exc}"]
@@ -156,14 +178,13 @@ def main() -> int:
             if artifact_id not in artifact_by_id:
                 errors.append(f"{claim_id}: неизвестный artifact_id {artifact_id}")
 
-        groups_from_artifacts = {
-            artifact_by_id[artifact_id].get("independence_group", "")
-            for artifact_id in referenced
-            if artifact_id in artifact_by_id
-            and artifact_by_id[artifact_id].get("independence_group", "")
-        }
+        groups = artifact_groups(referenced, artifact_by_id)
         groups_declared = set(split_ids(row.get("supporting_independence_groups", "")))
-        groups = groups_from_artifacts | groups_declared
+        unbacked = sorted(groups_declared - groups)
+        if unbacked:
+            warnings.append(
+                f"{claim_id}: группы объявлены без артефактов в artifact_ids: {', '.join(unbacked)}"
+            )
 
         if status in CORROBORATED and len(groups) < 2:
             warnings.append(
@@ -176,23 +197,24 @@ def main() -> int:
                 f"{claim_id}: несколько независимых групп, но статус всё ещё single-source; проверьте конфликт/полноту"
             )
         if status == "strongly-corroborated":
-            direct = any(
-                artifact_by_id[artifact_id].get("directness", "").lower() == "direct"
-                for artifact_id in referenced
-                if artifact_id in artifact_by_id
-            )
-            provenance = any(
-                artifact_by_id[artifact_id].get("originality", "").lower()
-                in {"original", "image-of-original", "official-extract"}
-                for artifact_id in referenced
-                if artifact_id in artifact_by_id
-            )
-            if not direct:
-                warnings.append(f"{claim_id}: strongly-corroborated без прямого артефакта")
-            if not provenance:
-                warnings.append(
-                    f"{claim_id}: strongly-corroborated без оригинала, образа оригинала или официальной выписки"
-                )
+            known = [artifact_by_id[a] for a in referenced if a in artifact_by_id]
+            is_direct = [a.get("directness", "").lower() == "direct" for a in known]
+            has_provenance = [
+                a.get("originality", "").lower() in PROVENANCED_ORIGINALITY for a in known
+            ]
+            # Протокол требует одну запись, которая одновременно прямая и с установленным происхождением.
+            if not any(d and p for d, p in zip(is_direct, has_provenance)):
+                if not any(is_direct):
+                    warnings.append(f"{claim_id}: strongly-corroborated без прямого артефакта")
+                if not any(has_provenance):
+                    warnings.append(
+                        f"{claim_id}: strongly-corroborated без оригинала, образа оригинала или официальной выписки"
+                    )
+                if any(is_direct) and any(has_provenance):
+                    warnings.append(
+                        f"{claim_id}: strongly-corroborated: прямота и происхождение есть только у разных "
+                        "артефактов; нужна одна прямая запись с установленным происхождением"
+                    )
 
     for row in relationships:
         relation_id = row.get("relationship_id", "<без ID>")
@@ -209,15 +231,14 @@ def main() -> int:
         for artifact_id in artifact_refs:
             if artifact_id not in artifact_by_id:
                 errors.append(f"{relation_id}: неизвестный artifact_id {artifact_id}")
-        if row.get("status", "") in CORROBORATED:
-            supporting_ids = split_ids(row.get("supporting_artifact_ids", ""))
-            groups = set(split_ids(row.get("independence_groups", "")))
-            groups.update(
-                artifact_by_id[artifact_id].get("independence_group", "")
-                for artifact_id in supporting_ids
-                if artifact_id in artifact_by_id
-                and artifact_by_id[artifact_id].get("independence_group", "")
+        groups = artifact_groups(split_ids(row.get("supporting_artifact_ids", "")), artifact_by_id)
+        unbacked = sorted(set(split_ids(row.get("independence_groups", ""))) - groups)
+        if unbacked:
+            warnings.append(
+                f"{relation_id}: группы объявлены без артефактов в supporting_artifact_ids: "
+                f"{', '.join(unbacked)}"
             )
+        if row.get("status", "") in CORROBORATED:
             if len(groups) < 2:
                 warnings.append(
                     f"{relation_id}: статус {row.get('status')}, но указано независимых групп: {len(groups)}"
